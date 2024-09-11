@@ -107,7 +107,7 @@ def _parse_ai_result(ai_result: Any, expected_return_type: Any) -> Any:
     data = ast.literal_eval(to_return)
     return typeguard.check_type(data, expected_return_type)
 
-
+# Include temperature control and token limit handling
 def ghostfunction(
     function: Optional[Callable[..., Any]] = None,
     /,
