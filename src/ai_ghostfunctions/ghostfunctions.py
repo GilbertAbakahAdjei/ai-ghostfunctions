@@ -2,7 +2,7 @@
 import ast
 import inspect
 import os
-from functools import wraps
+from functools import wraps, lru_cache
 from typing import Any
 from typing import Callable
 from typing import List
@@ -11,6 +11,7 @@ from typing import get_type_hints
 
 import openai
 import typeguard
+import tiktoken
 
 from .keywords import ASSISTANT
 from .keywords import SYSTEM
@@ -107,7 +108,31 @@ def _parse_ai_result(ai_result: Any, expected_return_type: Any) -> Any:
     data = ast.literal_eval(to_return)
     return typeguard.check_type(data, expected_return_type)
 
-# Include temperature control and token limit handling
+
+def truncate_prompt(prompt: List[Message], max_tokens: int = 4000) -> List[Message]:
+    """Truncate the prompt to fit within the token limit."""
+    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    
+    def count_tokens(text: str) -> int:
+        return len(encoding.encode(text))
+
+    total_tokens = sum(count_tokens(msg["content"]) for msg in prompt)
+    
+    while total_tokens > max_tokens and len(prompt) > 1:
+        # Remove the second message (keeping system message)
+        removed_message = prompt.pop(1)
+        total_tokens -= count_tokens(removed_message["content"])
+    
+    if total_tokens > max_tokens:
+        # If still over limit, truncate the last message
+        last_message = prompt[-1]
+        available_tokens = max_tokens - (total_tokens - count_tokens(last_message["content"]))
+        truncated_content = encoding.decode(encoding.encode(last_message["content"])[:available_tokens])
+        prompt[-1] = Message(role=last_message["role"], content=truncated_content)
+    
+    return prompt
+
+
 def ghostfunction(
     function: Optional[Callable[..., Any]] = None,
     /,
@@ -116,6 +141,8 @@ def ghostfunction(
     prompt_function: Callable[
         [Callable[..., Any]], List[Message]
     ] = _default_prompt_creation,
+    temperature: float = 0.7,
+    max_tokens: int = 4000,
     **kwargs: Any,
 ) -> Callable[..., Any]:
     """Make `function` a ghostfunction, dispatching logic to the AI.
@@ -124,6 +151,8 @@ def ghostfunction(
         function: The function to decorate
         ai_callable: Function to receives output of prompt_function and return result.
         prompt_function: Function to turn the function into a prompt.
+        temperature: Controls randomness in AI responses.
+        max_tokens: Maximum number of tokens allowed in the prompt.
         kwargs: Extra keyword arguments to pass to `ai_callable`.
 
     Returns:
@@ -138,8 +167,9 @@ def ghostfunction(
 
         @wraps(function)
         def wrapper(**kwargs_inner: Any) -> Any:
-            prompt = prompt_function(function, **kwargs_inner)  # type: ignore[arg-type]
-            ai_result = ai_callable(messages=prompt, **kwargs)  # type: ignore[misc]
+            prompt = prompt_function(function, **kwargs_inner)
+            truncated_prompt = truncate_prompt(prompt, max_tokens)
+            ai_result = ai_callable(messages=truncated_prompt, temperature=temperature, **kwargs)
             return _parse_ai_result(
                 ai_result=ai_result, expected_return_type=return_type_annotation
             )
@@ -147,7 +177,6 @@ def ghostfunction(
         return wrapper
 
     else:
-
         def new_decorator(
             function_to_be_decorated: Callable[..., Any]
         ) -> Callable[..., Any]:
@@ -157,7 +186,8 @@ def ghostfunction(
             @wraps(function_to_be_decorated)
             def wrapper(**kwargs_inner: Any) -> Any:
                 prompt = prompt_function(function_to_be_decorated, **kwargs_inner)
-                ai_result = ai_callable(messages=prompt, **kwargs)  # type: ignore[misc]
+                truncated_prompt = truncate_prompt(prompt, max_tokens)
+                ai_result = ai_callable(messages=truncated_prompt, temperature=temperature, **kwargs)
                 return _parse_ai_result(
                     ai_result=ai_result, expected_return_type=return_type_annotation
                 )
